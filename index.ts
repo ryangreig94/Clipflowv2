@@ -1,24 +1,25 @@
 /**
- * ClipFlow Render Worker
+ * ClipFlow Discovery Worker
  * 
  * This worker runs on Railway/Fly.io and handles:
- * - Polling render_tasks table for queued tasks
- * - Downloading source videos
- * - Processing with FFmpeg
- * - Uploading results to Supabase Storage
- * - Updating task/job status
+ * - Polling video_processing_jobs for discover jobs
+ * - Searching platforms (Twitch, YouTube, Rumble) for viral content
+ * - Creating candidate clips for rendering
  * 
  * Environment variables required:
  * - SUPABASE_URL
  * - SUPABASE_SERVICE_ROLE_KEY
  * - WORKER_ID (unique identifier for this worker instance)
+ * - TWITCH_CLIENT_ID (optional)
+ * - TWITCH_CLIENT_SECRET (optional)
+ * - YOUTUBE_API_KEY (optional)
  */
 
 import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = process.env.SUPABASE_URL!;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-const workerId = process.env.WORKER_ID || `worker-${Date.now()}`;
+const workerId = process.env.WORKER_ID || `discover-${Date.now()}`;
 
 if (!supabaseUrl || !supabaseServiceKey) {
   console.error('Missing required environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY');
@@ -33,70 +34,48 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey, {
 });
 
 const POLL_INTERVAL_MS = 5000; // 5 seconds
-const MAX_ATTEMPTS = 3;
 const HEARTBEAT_INTERVAL_MS = 60000; // 60 seconds
 
-interface RenderTask {
-  task_id: string;
-  task_job_id: string;
-  task_user_id: string;
-  task_input: Record<string, unknown>;
+interface DiscoverJob {
+  id: string;
+  user_id: string;
+  source_platform: string | null;
+  source_query: string | null;
+  category: string | null;
+  keywords: string | null;
 }
 
-async function claimTask(): Promise<RenderTask | null> {
-  const { data, error } = await supabase.rpc('claim_render_task', {
-    worker_id_input: workerId,
-  });
+async function claimDiscoverJob(): Promise<DiscoverJob | null> {
+  // Atomically claim the oldest ready discover job
+  const { data, error } = await supabase
+    .from('video_processing_jobs')
+    .update({ 
+      status: 'processing',
+      updated_at: new Date().toISOString()
+    })
+    .eq('job_type', 'discover')
+    .eq('status', 'ready')
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .select()
+    .single();
 
   if (error) {
-    console.error('Error claiming task:', error);
+    if (error.code !== 'PGRST116') { // No rows found
+      console.error('Error claiming discover job:', error);
+    }
     return null;
   }
 
-  if (!data || data.length === 0) {
-    return null;
-  }
-
-  const task = data[0];
-  return {
-    task_id: task.task_id,
-    task_job_id: task.task_job_id,
-    task_user_id: task.task_user_id,
-    task_input: task.task_input,
-  };
-}
-
-async function updateTaskStatus(
-  taskId: string,
-  status: 'rendering' | 'done' | 'failed',
-  output?: Record<string, unknown>
-) {
-  const updates: Record<string, unknown> = { status };
-  if (output) {
-    updates.output = output;
-  }
-
-  const { error } = await supabase
-    .from('render_tasks')
-    .update(updates)
-    .eq('id', taskId);
-
-  if (error) {
-    console.error('Error updating task status:', error);
-  }
+  return data as DiscoverJob;
 }
 
 async function updateJobStatus(
   jobId: string,
   status: 'processing' | 'done' | 'failed',
-  renderStatus: 'rendering' | 'done' | 'failed',
-  resultUrl?: string,
   errorMsg?: string
 ) {
-  const updates: Record<string, unknown> = { status, render_status: renderStatus };
-  if (resultUrl) {
-    updates.result_url = resultUrl;
-  }
+  const updates: Record<string, unknown> = { status };
   if (errorMsg) {
     updates.error = errorMsg;
   }
@@ -111,116 +90,153 @@ async function updateJobStatus(
   }
 }
 
-async function processTask(task: RenderTask): Promise<void> {
-  console.log(`Processing task ${task.task_id} for job ${task.task_job_id}`);
-  
-  const input = task.task_input;
-  const jobType = input.job_type as string;
+async function createClipJob(
+  userId: string,
+  parentJobId: string,
+  clip: {
+    title: string;
+    source_url: string;
+    source_platform: string;
+    viral_score: number;
+    duration?: number;
+    thumbnail_url?: string;
+  }
+) {
+  const { error } = await supabase.from('video_processing_jobs').insert({
+    user_id: userId,
+    job_type: 'render_clip',
+    source_platform: clip.source_platform,
+    source_url: clip.source_url,
+    title: clip.title,
+    viral_score: clip.viral_score,
+    duration: clip.duration,
+    thumbnail_url: clip.thumbnail_url,
+    status: 'ready',
+    render_status: 'queued',
+    keywords: `parent:${parentJobId}`,
+  });
+
+  if (error) {
+    console.error('Error creating clip job:', error);
+  }
+}
+
+async function processDiscoverJob(job: DiscoverJob): Promise<void> {
+  console.log(`Processing discover job ${job.id}`);
+  console.log(`Platform: ${job.source_platform}, Query: ${job.source_query}, Category: ${job.category}`);
   
   try {
-    // Update job status to processing
-    await updateJobStatus(task.task_job_id, 'processing', 'rendering');
-
-    // TODO: Implement actual video processing based on job type
-    // For now, simulate processing
-    console.log(`Job type: ${jobType}`);
-    console.log(`Input:`, JSON.stringify(input, null, 2));
-
-    switch (jobType) {
-      case 'ai_short':
-        await processAIShort(task);
-        break;
-      case 'long_form':
-        await processLongForm(task);
-        break;
-      case 'render_clip':
-        await processRenderClip(task);
-        break;
-      default:
-        throw new Error(`Unknown job type: ${jobType}`);
-    }
-
-    // Mark task as done
-    await updateTaskStatus(task.task_id, 'done', { completed_at: new Date().toISOString() });
-    await updateJobStatus(task.task_job_id, 'done', 'done');
+    const platform = job.source_platform || 'all';
+    const query = job.source_query || job.keywords || '';
+    const category = job.category || 'gaming';
     
-    console.log(`Task ${task.task_id} completed successfully`);
-
+    // TODO: Implement actual platform API calls
+    // For now, generate simulated clips
+    const clips = await discoverClips(platform, query, category, job.user_id, job.id);
+    
+    console.log(`Found ${clips.length} clips`);
+    
+    // Create render jobs for each discovered clip
+    for (const clip of clips) {
+      await createClipJob(job.user_id, job.id, clip);
+    }
+    
+    await updateJobStatus(job.id, 'done');
+    console.log(`Discover job ${job.id} completed`);
+    
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-    console.error(`Task ${task.task_id} failed:`, errorMsg);
-    
-    await updateTaskStatus(task.task_id, 'failed', { error: errorMsg });
-    await updateJobStatus(task.task_job_id, 'failed', 'failed', undefined, errorMsg);
+    console.error(`Discover job ${job.id} failed:`, errorMsg);
+    await updateJobStatus(job.id, 'failed', errorMsg);
   }
 }
 
-async function processAIShort(task: RenderTask): Promise<void> {
-  const input = task.task_input;
-  const keywords = input.keywords as string || '';
+async function discoverClips(
+  platform: string,
+  query: string,
+  category: string,
+  userId: string,
+  parentJobId: string
+): Promise<Array<{
+  title: string;
+  source_url: string;
+  source_platform: string;
+  viral_score: number;
+  duration?: number;
+  thumbnail_url?: string;
+}>> {
+  // TODO: Implement actual platform discovery
+  // - Twitch: Use Twitch API to find popular clips
+  // - YouTube: Use YouTube API to search for trending shorts
+  // - Rumble: Use Rumble API/scraping for viral content
   
-  // Parse topic and script from keywords
-  const topicMatch = keywords.match(/topic:([^|]+)/);
-  const scriptMatch = keywords.match(/script:(.+)/);
-  
-  const topic = topicMatch ? topicMatch[1] : 'general';
-  const script = scriptMatch ? scriptMatch[1] : '';
-  
-  console.log(`Generating AI Short for topic: ${topic}`);
-  if (script) {
-    console.log(`Custom script: ${script}`);
-  }
-  
-  // TODO: Integrate with AI service for script generation
-  // TODO: Integrate with TTS service for voiceover
-  // TODO: Integrate with image/video generation service
-  // TODO: Use FFmpeg to composite final video
-  
-  // Simulate processing time
+  // Simulate discovery process
   await new Promise(resolve => setTimeout(resolve, 2000));
   
-  // TODO: Upload to Supabase Storage and return URL
-  console.log('AI Short processing complete (simulated)');
-}
-
-async function processLongForm(task: RenderTask): Promise<void> {
-  const input = task.task_input;
-  const sourceUrl = input.source_url as string;
+  // Return simulated clips based on category
+  const clipTemplates: Record<string, string[]> = {
+    gaming: [
+      'Insane clutch play in ranked',
+      'World first boss kill reaction',
+      'Funniest rage quit ever',
+      'Pro player gets outplayed',
+      'Crazy speedrun skip discovered',
+    ],
+    comedy: [
+      'Stand-up comedy gold moment',
+      'Hilarious fail compilation',
+      'Comedian roasts audience member',
+      'Unexpected plot twist reaction',
+      'Best improv moment of the night',
+    ],
+    podcast: [
+      'Mind-blowing fact revealed',
+      'Guest drops bombshell',
+      'Host can\'t stop laughing',
+      'Controversial take goes viral',
+      'Expert explains complex topic simply',
+    ],
+    sports: [
+      'Unbelievable goal from midfield',
+      'Last second buzzer beater',
+      'Record-breaking performance',
+      'Player mic\'d up moment',
+      'Coach\'s epic halftime speech',
+    ],
+    news: [
+      'Breaking news moment',
+      'Reporter keeps composure',
+      'Interviewee walks off set',
+      'Live news blooper',
+      'Anchor\'s honest reaction',
+    ],
+  };
   
-  console.log(`Processing long-form video from: ${sourceUrl}`);
+  const titles = clipTemplates[category] || clipTemplates.gaming;
+  const actualPlatform = platform === 'all' ? ['twitch', 'youtube', 'rumble'][Math.floor(Math.random() * 3)] : platform;
   
-  // TODO: Download video using yt-dlp
-  // TODO: Use AI to detect viral moments
-  // TODO: Extract clips using FFmpeg
-  // TODO: Upload clips to Supabase Storage
+  // Return 3-5 simulated clips
+  const numClips = Math.floor(Math.random() * 3) + 3;
+  const clips = [];
   
-  // Simulate processing time
-  await new Promise(resolve => setTimeout(resolve, 3000));
+  for (let i = 0; i < numClips; i++) {
+    clips.push({
+      title: `${titles[i % titles.length]} - ${query || category}`,
+      source_url: `https://${actualPlatform}.example.com/clip/${Date.now()}-${i}`,
+      source_platform: actualPlatform,
+      viral_score: Math.floor(Math.random() * 30) + 70, // 70-100
+      duration: Math.floor(Math.random() * 45) + 15, // 15-60 seconds
+    });
+  }
   
-  console.log('Long-form processing complete (simulated)');
-}
-
-async function processRenderClip(task: RenderTask): Promise<void> {
-  const input = task.task_input;
-  
-  console.log(`Rendering clip with input:`, input);
-  
-  // TODO: Download source clip
-  // TODO: Apply styling/branding
-  // TODO: Render with FFmpeg
-  // TODO: Upload to Supabase Storage
-  
-  // Simulate processing time
-  await new Promise(resolve => setTimeout(resolve, 1500));
-  
-  console.log('Clip rendering complete (simulated)');
+  return clips;
 }
 
 async function sendHeartbeat() {
   try {
     const { error } = await supabase.from('worker_heartbeat').insert({
       source: workerId,
-      message: 'Render worker alive',
+      message: 'Discover worker alive',
     });
     
     if (error) {
@@ -234,7 +250,7 @@ async function sendHeartbeat() {
 }
 
 async function main() {
-  console.log(`ClipFlow Render Worker started (ID: ${workerId})`);
+  console.log(`ClipFlow Discover Worker started (ID: ${workerId})`);
   console.log(`Supabase URL: ${supabaseUrl}`);
   console.log(`Polling interval: ${POLL_INTERVAL_MS}ms`);
   console.log(`Heartbeat interval: ${HEARTBEAT_INTERVAL_MS}ms`);
@@ -247,12 +263,12 @@ async function main() {
   
   while (true) {
     try {
-      const task = await claimTask();
+      const job = await claimDiscoverJob();
       
-      if (task) {
-        await processTask(task);
+      if (job) {
+        await processDiscoverJob(job);
       } else {
-        // No tasks available, wait before polling again
+        // No jobs available, wait before polling again
         await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
       }
     } catch (error) {
